@@ -43,6 +43,10 @@ The high-level problem was straightforward: WeChat stores chat history in encryp
 
 I also looked at CipherTalk as prior art. I did not reuse its native binaries or copy its implementation, but it was a useful architectural reference: keep key acquisition separate from database export, treat key discovery as a diagnosable subsystem, and validate the key against real databases instead of assuming success after capture.
 
+The design decision that shaped the rest of the work was this: do not look for the key as a random artifact in memory; look for the point where the program has to use it. An encrypted database eventually has to be opened, and at that boundary the key has to cross from WeChat's account logic into WCDB's cipher configuration. That boundary is much more meaningful than an arbitrary byte pattern in a process dump.
+
+That is also what made the project feel like a reverse-engineering problem rather than just an extraction script. The binary analysis identified a semantic event, the debugger observed that event with minimal interference, SQLCipher validated the result, and the database schema work turned it into user-level records. Each stage produced evidence for the next one.
+
 ## First pass: identifying the storage layer
 
 The first static-analysis task was to confirm which database layer WeChat was using. The target binary contains WCDB-related logic, which is consistent with Tencent's own database stack.
@@ -61,6 +65,8 @@ This function matched the shape of WCDB's `Database::setCipherKey` path. The imp
 - otherwise a `CipherConfig` object is installed;
 - the caller supplies a page size and cipher version;
 - message-related callers use a 4096-byte cipher page size.
+
+This was the first important narrowing step. Instead of treating WeChat as a large opaque process and asking "where might the key be?", the target became one well-defined call site family: every encrypted WCDB database that matters must eventually install a cipher key. The reverse-engineering task became finding that boundary and understanding its calling convention.
 
 The local IDA database also got a few supporting names:
 
@@ -114,6 +120,8 @@ key_len    = *(uint64_t *)(RDX + 0x10)
 
 Then it reads `key_len` bytes at `key_buffer`. In this target, the useful key material was 32 bytes. It is important not to assume that every captured call is the message database key. Startup can call `setCipherKey` several times for different WCDB instances, so the exporter treats captures as candidates and verifies them against the actual database files.
 
+This candidate mindset matters. A breakpoint hit proves that WeChat passed some key-shaped data into WCDB; it does not prove that the captured value opens the message database snapshot. Treating the runtime observation as evidence, not as the final answer, kept the pipeline honest.
+
 ## Why I moved away from full memory scanning
 
 The first working idea was a process-memory scanner. The approach was based on a common SQLCipher/WCDB observation: in some code paths, the process contains strings shaped like:
@@ -140,6 +148,8 @@ I kept a throttled fallback scanner with conservative defaults:
 ```
 
 But for the real exporter I wanted something cleaner: catch the key at the point where WeChat itself passes it to WCDB.
+
+In practice, this is the difference between searching for a trace and observing a transaction. A scanner asks whether the key happens to be represented somewhere in memory in a form we recognize. A breakpoint on `setCipherKey` observes the moment WeChat intentionally gives the key to the storage layer. The second approach is quieter, more deterministic, and easier to reason about.
 
 ## CDB worked, but not cleanly enough
 
@@ -227,6 +237,8 @@ The tool writes the full capture result to a local sensitive JSON file. The cons
 
 The actual key is not printed in normal logs and is not written into exporter metadata.
 
+This approach has a useful property: the debugger does not need to understand the whole application. It only needs to understand one ABI boundary. Once `Weixin.dll` is loaded and the target RVA is known, the capture logic is just register state, pointer reads, a restored instruction byte, and a single-step continuation. That small surface area is what makes the method auditable.
+
 ## SQLCipher parameter discovery
 
 Capturing a 32-byte value is only half the problem. It still has to be applied to SQLCipher in the same way WeChat/WCDB applies it.
@@ -269,6 +281,8 @@ cipher compatibility: 3
 key mode:             hexkey
 ```
 
+This is where the pipeline avoids a common false-positive trap. Runtime capture can be correct while SQLCipher usage is wrong. SQLCipher can accept a PRAGMA sequence while the database still cannot be read. A database can decrypt while the snapshot is still incomplete. Each layer needs its own check.
+
 ## Snapshot first, decrypt later
 
 I strongly prefer decrypting a filesystem snapshot rather than reading active WeChat databases in place.
@@ -292,6 +306,8 @@ The safer workflow is:
 5. Decrypt the static snapshot.
 
 This keeps the expensive work out of the live WeChat process. SQLCipher export can be I/O-heavy, but it is operating on copied files, not on the running application.
+
+The separation also makes failure easier to localize. If key capture succeeds but probe-only verification fails, the problem is probably key selection or SQLCipher parameters. If probe-only succeeds but export fails, the problem is likely file consistency or exporter behavior. If export succeeds but a conversation is missing, the next suspect is snapshot inventory or schema mapping, not the cryptography.
 
 ## The snapshot completeness bug
 
@@ -332,6 +348,8 @@ resource rows:       35164
 ```
 
 This is the sort of bug that is easy to misdiagnose as a parser issue or a wrong key. The lesson is simple: before debugging schema logic, prove that the snapshot contains every relevant shard.
+
+That mistake was valuable because it exposed a better rule for the exporter: row counts are not just nice-to-have reporting. They are sanity checks. A technically successful decrypt with implausibly few messages should be treated as suspicious until the snapshot inventory has been compared with the source account directory.
 
 ## WeChat 4.x message sharding
 
@@ -429,6 +447,8 @@ is_session = 1
 
 and the direct table `Msg_<md5(username)>` existed.
 
+This is the second half of the reverse-engineering work. Decrypting the database is not the same as understanding the product's data model. The useful artifact is not "a decrypted SQLite file"; it is a reconstructed conversation. Getting there requires following WeChat's own identity chain from contact metadata to internal username to shard name to sender mapping.
+
 ## Parsing message content
 
 Plain text messages are not always stored as clean SQLite `TEXT`. In this build, `message_content` can be:
@@ -499,6 +519,8 @@ search Msg_<md5> across every message_*.db shard
 ```
 
 Sessions live in `session.db`, mainly in `SessionTable`. They are useful for finding recent conversations and display summaries, but they are not sufficient by themselves. A session can reference a username even when the actual message rows are in a different message shard.
+
+For historical exports, I treat sessions as hints rather than ground truth. The source of truth is the full set of message shards plus their local `Name2Id` tables. This is less convenient than reading one recent-session table, but it is the only approach that survived real validation.
 
 ## The exporter pipeline
 
@@ -623,6 +645,8 @@ tools/wechat_auto_export.sh \
 
 I used a few checks to avoid fooling myself.
 
+That framing is deliberate. The easiest way to get this kind of tool wrong is to stop at the first positive signal: a breakpoint hit, a candidate key, a decrypted schema, or a handful of plausible messages. The pipeline only became trustworthy after every stage had a narrow, concrete proof attached to it.
+
 ### SQLCipher validation
 
 Every candidate key mode must successfully query:
@@ -674,6 +698,8 @@ readable CSV rows:    7413
 ```
 
 The JSONL and CSV counts must match. CSV physical line count is not a reliable check because message contents can contain newlines.
+
+The most useful validation was end-to-end: binary offset, runtime capture, SQLCipher probe, database inventory, schema parsing, and final row counts all had to agree. When a specific conversation was requested, the export had to be explainable through the same chain: contact metadata resolved to an internal username, the username hashed to message table names, the tables existed in specific shards, and the row counts matched across raw and readable outputs.
 
 ## Operational details that mattered
 
@@ -742,4 +768,6 @@ The core of the project was not any single trick. The useful result came from co
 - schema-driven message parsing;
 - verification at every step.
 
-The main takeaway is that WeChat 4.x chat export is less about "finding the key" in isolation and more about building a reliable pipeline around the key. Once the breakpoint capture and SQLCipher mode are correct, the remaining work is database engineering: copy the right files, decrypt them consistently, understand the sharding scheme, and never trust a partial snapshot.
+The part I like most is the shift in perspective: do not find the key; find where the key is used. That is the more natural reverse-engineering move. A storage layer boundary carries intent. A byte pattern in memory is only residue.
+
+The main takeaway is that WeChat 4.x chat export is less about "finding the key" in isolation and more about building a reliable pipeline around that semantic boundary. Once the breakpoint capture and SQLCipher mode are correct, the remaining work is database engineering: copy the right files, decrypt them consistently, understand the sharding scheme, and never trust a partial snapshot. The satisfying part is the closed loop from binary-level behavior to a user-level artifact that can be counted, filtered, and explained.
