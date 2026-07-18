@@ -1,0 +1,29 @@
+# Generated sensitive data
+exports/
+**/exports/
+key-candidates*.json
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.jsonl
+*.csv
+
+# Reverse-engineering work products not suitable for public release
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.dmp
+*.dump
+*.log
+
+# Python / PowerShell / OS noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+Thumbs.db

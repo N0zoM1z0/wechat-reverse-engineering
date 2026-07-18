@@ -1,0 +1,34 @@
+{
+  "target": {
+    "module": "Weixin.dll",
+    "version_observed": "4.1.11.54",
+    "sha256": "260e7b50797fb52ce6d86af215865b54628904fce67cf629c86190f6878111d8",
+    "set_cipher_key_rva": "0x5D79A0"
+  },
+  "capture": {
+    "method": "Windows Debug API breakpoint",
+    "breakpoint_hits": 16,
+    "unique_key_candidates": 1
+  },
+  "sqlcipher": {
+    "cipher_compatibility": 3,
+    "cipher_order": "compat_first",
+    "cipher_key_mode": "hexkey"
+  },
+  "export": {
+    "decrypted_database_count": 12,
+    "failed_database_count": 0,
+    "schema_database_count": 12,
+    "message_rows": 171392,
+    "session_rows": 356,
+    "contact_entries": 4105,
+    "resource_rows": 35164
+  },
+  "privacy": {
+    "contains_key_material": false,
+    "contains_account_identifier": false,
+    "contains_message_content": false,
+    "contains_contact_data": false,
+    "contains_local_path": false
+  }
+}
