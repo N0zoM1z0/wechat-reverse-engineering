@@ -1,22 +1,20 @@
-# Scripts
+# Local tools
 
-These scripts are original tooling for authorized local research.
+- `Get-WeChat4ConfigKeys.ps1`: default read-only capture for validated 4.2.0.12;
+  requires a fresh `-OutFile`, with optional `-ProcessId`, `-TimeoutSeconds`
+  and `-MaxCandidates`. Console output contains counts only.
+- `wechat_export.py`: stable snapshot copying, per-database key selection,
+  SQLCipher decryption/integrity checks, Zstandard text decoding and JSONL/CSV.
+  `--auto-key` invokes Config.Cipher capture. Offline snapshots need no account path.
+- `export_selected_groups.py`: readable groups across shards, sender resolution,
+  credential masking, image/sticker placeholders, CSV/TXT/JSONL.
+- `wechat_auto_export.sh`: WSL capture/snapshot/probe/export wrapper, independent
+  of the working directory. Run with `--help` for options.
+- `Capture-WeChatKey-DebugApi.ps1` / `Capture-WeChatKey-Cdb.ps1`: historical
+  build-specific capture; the pinned offset belongs to 4.1.11.54 only.
+- `Get-WeChatDbKey.ps1`: legacy plaintext-cache scanner with bounded region-tail
+  handling; modern masked caches need the Config.Cipher adapter.
 
-## Safety defaults
-
-- `Capture-WeChatKey-DebugApi.ps1` requires `-OutFile` and prints only a summary to stdout.
-- `Capture-WeChatKey-Cdb.ps1` redacts key material in stdout; pass `-OutFile` only for local sensitive storage.
-- `wechat_auto_export.sh` requires explicit account, snapshot, and WeChat executable paths.
-- Generated `exports/`, key candidate files, decrypted databases, CSVs, and JSONL files are ignored by Git and must not be committed.
-
-## Main scripts
-
-```text
-Capture-WeChatKey-DebugApi.ps1  preferred low-load key capture
-Capture-WeChatKey-Cdb.ps1       backup cdb-based capture
-Get-WeChatDbKey.ps1             throttled diagnostic memory scanner
-wechat_export.py                snapshot/decrypt/export pipeline
-wechat_auto_export.sh           WSL workflow wrapper
-```
-
-Use these only on accounts and machines you are authorized to inspect.
+See [the operation guide](../README.md) for commands and the distinction between
+private full exports and redacted derivatives. The config adapter contains
+attributed Apache-2.0 portions; see [notices](../../THIRD_PARTY_NOTICES.md).

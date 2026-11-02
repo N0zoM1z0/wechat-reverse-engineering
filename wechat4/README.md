@@ -1,89 +1,132 @@
-# WeChat 4.x Case Study
+# WeChat 4.x local export
 
-This directory contains a sanitized public version of the WeChat for Windows 4.x local chat-storage study.
+The current workflow was validated against Windows WeChat **4.2.0.12**. The
+original 4.1.11.54 study remains in [BLOG.md](BLOG.md) and the address map.
 
-The goal is not to distribute private data or a universal decryptor. The goal is to document a reproducible analysis path and provide original tooling for authorized local research:
+## Requirements
 
-- identify the WCDB key-setting path;
-- capture local key candidates with a precise runtime breakpoint;
-- verify SQLCipher parameters against copied databases;
-- export a local snapshot into readable JSONL/CSV.
-
-## Directory layout
-
-```text
-BLOG.md                 full narrative write-up
-scripts/                PowerShell, Python, and WSL helper scripts
-reverse/analysis/       compact address map and schema notes
-artifacts/validation/   sanitized validation summary only
-```
-
-## Tooling
-
-### `scripts/Capture-WeChatKey-DebugApi.ps1`
-
-Preferred key-capture path. It launches `Weixin.exe` under the Windows Debug API, waits for `Weixin.dll`, sets a one-byte breakpoint at the pinned `WCDB_Database_setCipherKey` RVA, reads the key object from the x64 calling convention, collects candidates, restores the original byte, and detaches.
-
-The script requires an explicit `-WeChatExe` path in the public version.
-
-### `scripts/wechat_export.py`
-
-Snapshot/decrypt/export tool. It can:
-
-- discover WeChat account folders under WSL;
-- copy `.db`, `.db-wal`, and `.db-shm` families;
-- probe SQLCipher key modes (`raw64`, `raw96`, `asciihex`, `hexkey`);
-- decrypt copied databases with `sqlcipher_export`;
-- export schema, contacts, sessions, messages, and resource tables.
-
-### `scripts/wechat_auto_export.sh`
-
-WSL wrapper for the capture/probe/export workflow. The public version requires explicit `--account-path`, `--snapshot-dir`, and `--wechat-exe` arguments.
-
-## Example workflow
-
-Take a snapshot while WeChat is closed:
+- Windows with 64-bit PowerShell, logged-in WeChat, and read access to its main process.
+- WSL with Python 3.10+, SQLCipher **4**, `wslpath` and `powershell.exe` interop.
+- Compressed-message support (run from the repository root):
 
 ```bash
-python3 scripts/wechat_export.py \
-  --account-path /mnt/c/Users/<user>/Documents/xwechat_files/<wxid> \
-  --snapshot-only \
-  --out-dir exports/full-snapshot
+python3 -m pip install -r wechat4/scripts/requirements.txt
 ```
 
-Capture key candidates:
+The capture script can also run directly under Windows PowerShell; the wrapper
+and documented exporter workflow use WSL.
+
+## One-command export
+
+```bash
+bash wechat4/scripts/wechat_auto_export.sh \
+  --account-path '/mnt/c/Users/<user>/Documents/xwechat_files/<account>' \
+  --out-dir exports/current
+```
+
+The default `config` method reads Config.Cipher objects, decodes masked buffers
+and saves candidate keys only to an ignored local file. It does not restart
+WeChat, attach a debugger, or write process memory. If process auto-selection
+fails, add `--process-id <main-process-id>`.
+
+Each database receives its own authenticated key selection. Modern raw keys
+first pass a SQLCipher 4 page-HMAC check and schema read; decrypted databases
+must pass SQLite `quick_check`. Probe/export returns nonzero if any selected
+database fails. Metadata includes per-database parameters without key values.
+
+The wrapper finds tools relative to itself and works from other directories.
+Output paths remain relative to the caller. Add `--snapshot-dir PATH` to reuse
+an encrypted snapshot, or `--key-file PATH` for an existing candidate file.
+Existing key files are reused; choose a fresh path after login/account changes.
+
+## Separate capture and offline verification
+
+Capture from logged-in WeChat and verify an existing snapshot:
+
+```bash
+python3 wechat4/scripts/wechat_export.py \
+  --snapshot-dir exports/saved-snapshot/snapshot \
+  --auto-key --probe-only --out-dir exports/probe
+```
+
+Offline verification needs neither a running client nor an account directory:
+
+```bash
+python3 wechat4/scripts/wechat_export.py \
+  --snapshot-dir exports/saved-snapshot/snapshot \
+  --key-candidates-json exports/key-candidates.json \
+  --key-mode raw64 --probe-only --out-dir exports/probe-offline
+```
+
+Remove `--probe-only` and choose a fresh output directory to decrypt/export.
+Omit `--key-mode raw64` to probe legacy password captures.
+
+For a closed-state snapshot, quit WeChat, then run:
+
+```bash
+python3 wechat4/scripts/wechat_export.py \
+  --account-path '/mnt/c/Users/<user>/Documents/xwechat_files/<account>' \
+  --snapshot-only --out-dir exports/saved-snapshot
+```
+
+Live copying includes DB/WAL/SHM families and retries if DB/WAL size or mtime
+changes during copying. This stability check is not an atomic snapshot
+guarantee. Closed-state snapshots provide a stronger boundary. Missing history
+must first be imported through WeChat.
+
+## Readable selected groups
+
+```bash
+python3 wechat4/scripts/export_selected_groups.py \
+  --plain-root exports/current/plain \
+  --group 'Example Group' --group 'Another Group' \
+  --out-dir exports/readable
+```
+
+Exact names, remarks and chatroom usernames are accepted. Ambiguous names fail;
+use the exact chatroom username. Rows are merged across shards, deduplicated by
+server ID, sorted by time, and resolved against each shard's own `Name2Id`.
+Use `--timezone` to change the default `Asia/Shanghai` timezone.
+
+Outputs are UTF-8 TXT/JSONL and UTF-8-with-BOM CSV. Keys, labeled credentials,
+Bearer tokens and sensitive URL parameters are masked, including references.
+Images/stickers become `[图片]` / `[贴纸]`; supported cards retain readable
+text. System templates omit internal attachment keys. Rule-based masking cannot
+recognize every custom secret format; review intended public exports.
+
+Full exports and `plain/` remain private unredacted source material. Readable
+exports are separate derivatives; masking does not change source files.
+
+## Legacy debugger capture
+
+`0x5D79A0` is pinned to **4.1.11.54**, not 4.2.0.12. The wrapper requires an
+explicit verified offset for this route:
+
+```bash
+bash wechat4/scripts/wechat_auto_export.sh \
+  --account-path '/mnt/c/Users/<user>/Documents/xwechat_files/<account>' \
+  --snapshot-dir exports/saved-snapshot/snapshot \
+  --key-method debug-api --wechat-exe 'C:\Path\To\Weixin.exe' \
+  --cipher-rva 0x5D79A0 --out-dir exports/legacy
+```
+
+Only add `--kill-wechat` when you intend to terminate the existing instance;
+the default config method rejects it.
+
+## Verification and provenance
+
+```bash
+python3 -m unittest discover -s wechat4/tests -v
+bash -n wechat4/scripts/wechat_auto_export.sh
+```
+
+Windows synthetic capture test (no WeChat required):
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File "$(wslpath -w scripts/Capture-WeChatKey-DebugApi.ps1)" `
-  -WeChatExe "C:\Path\To\WeChat\Weixin.exe" `
-  -MaxCaptures 16 `
-  -OutFile "$(wslpath -w exports/key-candidates.json)"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wechat4\tests\Test-ConfigKeyCapture.ps1
 ```
 
-Verify without writing plaintext databases:
-
-```bash
-python3 scripts/wechat_export.py \
-  --account-path /mnt/c/Users/<user>/Documents/xwechat_files/<wxid> \
-  --snapshot-dir exports/full-snapshot/snapshot \
-  --key-candidates-json exports/key-candidates.json \
-  --probe-only \
-  --out-dir exports/probe
-```
-
-Export:
-
-```bash
-python3 scripts/wechat_export.py \
-  --account-path /mnt/c/Users/<user>/Documents/xwechat_files/<wxid> \
-  --snapshot-dir exports/full-snapshot/snapshot \
-  --key-candidates-json exports/key-candidates.json \
-  --out-dir exports/decrypted-full
-```
-
-## Output policy
-
-Everything under `exports/` is ignored. Treat it as sensitive: it may contain key candidates, encrypted snapshots, decrypted SQLite databases, contacts, sessions, and message records.
-
-Do not commit generated outputs.
+See [4.2 migration notes](reverse/analysis/WECHAT_4_2.md),
+[key capture](reverse/analysis/KEY_CAPTURE.md) and
+[third-party notices](../THIRD_PARTY_NOTICES.md).
+Generated keys, databases and exports are sensitive and ignored by Git.

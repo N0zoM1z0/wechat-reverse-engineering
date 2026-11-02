@@ -1,3 +1,10 @@
+> 2026-11 update: this article preserves the original 4.1.11.54 study.
+> The default tools now support the validated 4.2.0.12 Config.Cipher path and
+> independent keys per database. See the [current guide](README.md) and
+> [migration notes](reverse/analysis/WECHAT_4_2.md). Historical compatibility
+> labels from compatibility-before-key probes are not definitive evidence of
+> the effective SQLCipher version.
+
 # Reversing WeChat 4.x Chat Storage and Building a Practical Exporter
 
 This write-up documents a local reverse-engineering pass against WeChat for Windows 4.x, with one practical goal: export chat records from a real local profile without relying on a prebuilt third-party decryptor.

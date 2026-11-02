@@ -1,0 +1,37 @@
+{
+  "validation_date": "2026-11-02",
+  "observed_build": "4.2.0.12",
+  "module_sha256": "2b3677c3f932daaa4ef84c8b2acd0aee12cbe5a779ff9e740c370761e5c291ce",
+  "capture_method": "read-only Config.Cipher traversal and XOR decoding",
+  "runtime_capture_evidence": "Traversal validated in the preceding local export; final bounded adapter also passed a synthetic Windows self-process test",
+  "offline_validation": {
+    "databases_selected": 12,
+    "databases_verified_and_decrypted": 12,
+    "failed_databases": 0,
+    "message_rows": 186622,
+    "resource_rows": 37983,
+    "cipher_compatibility": 4,
+    "key_mode": "raw64",
+    "per_database_key_selection": true,
+    "sqlite_quick_check": "passed"
+  },
+  "selected_group_validation": {
+    "groups": 2,
+    "message_rows": 1609,
+    "matches_previously_verified_export": true,
+    "csv_jsonl_content_match": true,
+    "media_placeholders_checked": true,
+    "credential_redaction_checked": true
+  },
+  "synthetic_regression_tests": 11,
+  "windows_synthetic_capture_test": "passed; console output contained no candidate key",
+  "wrapper_from_unrelated_working_directory": "passed",
+  "sensitive_material_in_public_tree": false,
+  "limitations": [
+    "No new debugger RVA was established for this build",
+    "Config.Cipher offsets and XOR mask remain build-dependent",
+    "No claim of compatibility with every future WeChat release",
+    "Live-copy stability checks do not establish atomic snapshot consistency",
+    "Rule-based redaction cannot recognize every custom secret format"
+  ]
+}

@@ -79,3 +79,11 @@ contact alias / remark / nick_name
 ```
 
 `session.db` is useful for recent conversation summaries, but a session row is not enough to locate all historical messages. Always search every message shard.
+
+## Modern compressed message bodies
+
+4.2 message content may be a Zstandard BLOB (magic bytes `28 B5 2F FD`), even
+when the declared column type is TEXT. Decode by the actual SQLite value type
+and decompress before UTF-8 decoding. Install `scripts/requirements.txt` for
+this path. Resolve `real_sender_id` through the row's own shard `Name2Id`;
+identical numeric IDs across different shards can refer to different senders.

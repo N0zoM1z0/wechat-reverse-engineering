@@ -248,6 +248,7 @@ try {
                     }
                 }
 
+                if ($cursor + $requested -ge $regionEnd) { break }
                 $cursor += [Math]::Max(1, $requested - $overlap)
                 if ($ThrottleMs -gt 0) {
                     Start-Sleep -Milliseconds $ThrottleMs

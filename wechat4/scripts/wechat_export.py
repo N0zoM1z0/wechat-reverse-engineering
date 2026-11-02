@@ -6,12 +6,14 @@ import csv
 import datetime as dt
 import glob
 import hashlib
+import hmac
 import json
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
+import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -144,12 +146,25 @@ def copy_database_family(account_path: Path, rel: str, snapshot_root: Path) -> P
     source = account_path / rel
     target = snapshot_root / rel
     target.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in ("", "-wal", "-shm"):
-        item = Path(str(source) + suffix)
-        if item.exists():
-            out = Path(str(target) + suffix)
-            shutil.copy2(item, out)
-    return target
+    if source.resolve() == target.resolve():
+        fail("snapshot destination must differ from the live database")
+    def stamps():
+        return [(p.name, p.stat().st_size, p.stat().st_mtime_ns)
+                for p in (source, Path(str(source) + "-wal")) if p.exists()]
+    for _ in range(3):
+        try:
+            before = stamps()
+            for suffix in ("", "-wal", "-shm"):
+                item, out = Path(str(source) + suffix), Path(str(target) + suffix)
+                if item.exists():
+                    shutil.copy2(item, out)
+                elif out.exists():
+                    out.unlink()
+            if before == stamps():
+                return target
+        except FileNotFoundError:
+            continue
+    fail(f"database changed during all snapshot attempts: {source.name}; retry when idle or use a closed-state snapshot")
 
 
 def make_snapshot(account_path: Path, out_dir: Path) -> list[Path]:
@@ -174,7 +189,21 @@ def run_sqlcipher(db_path: Path, script: str) -> subprocess.CompletedProcess[str
     )
 
 
+def require_sqlcipher4() -> str:
+    try:
+        result = run_sqlcipher(Path(":memory:"), "PRAGMA cipher_version;\n.quit\n")
+    except FileNotFoundError:
+        fail("sqlcipher executable not found; install SQLCipher 4 before exporting")
+    version = result.stdout.strip()
+    match = re.match(r"(\d+)\.", version)
+    if result.returncode or not match or int(match[1]) < 4:
+        fail("SQLCipher 4 or newer is required for reliable compatibility probes")
+    return version
+
+
 def to_windows_path(path: Path) -> str:
+    if os.name == "nt":
+        return str(path.resolve())
     result = subprocess.run(
         ["wslpath", "-w", str(path)],
         text=True,
@@ -187,6 +216,23 @@ def to_windows_path(path: Path) -> str:
     if result.returncode != 0:
         fail(f"wslpath failed for {path}: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def capture_config_keys(out_file: Path, process_id: int | None = None) -> list[str]:
+    script = Path(__file__).resolve().with_name("Get-WeChat4ConfigKeys.ps1")
+    command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+               to_windows_path(script), "-OutFile", to_windows_path(out_file)]
+    if process_id is not None:
+        command += ["-ProcessId", str(process_id)]
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode:
+        fail("Config.Cipher capture failed; verify WeChat is logged in and the process is readable. "
+             + result.stderr.strip()[-1000:])
+    try:
+        out_file.chmod(0o600)
+    except OSError:
+        pass
+    return load_key_candidates(out_file)
 
 
 def capture_key_with_powershell(database_path: Path) -> str:
@@ -245,47 +291,52 @@ def sqlcipher_key_pragma(db_path: Path, key_hex: str, key_mode: str) -> str:
 
 def sqlcipher_probe_script(db_path: Path, key_hex: str, compatibility: int, order: str, key_mode: str) -> str:
     key_pragma = sqlcipher_key_pragma(db_path, key_hex, key_mode)
-    if order == "compat_first":
-        pragmas = [
-            f"PRAGMA cipher_compatibility = {compatibility};",
-            key_pragma,
-            "PRAGMA cipher_page_size = 4096;",
-        ]
-    else:
-        pragmas = [
-            key_pragma,
-            f"PRAGMA cipher_compatibility = {compatibility};",
-            "PRAGMA cipher_page_size = 4096;",
-        ]
+    # Compatibility is connection-specific and must be set AFTER the key.
+    pragmas = [key_pragma, f"PRAGMA cipher_compatibility = {compatibility};",
+               "PRAGMA cipher_page_size = 4096;"]
     return "\n".join(pragmas + ["SELECT count(*) FROM sqlite_master;", ".quit"]) + "\n"
 
 
 def sqlcipher_probe_success(result: subprocess.CompletedProcess[str]) -> bool:
-    return result.returncode == 0 and re.search(r"\b[0-9]+\b", result.stdout) is not None
+    return result.returncode == 0 and re.search(r"(?m)^\d+\s*$", result.stdout) is not None
 
 
-def probe_cipher_params(db_path: Path, key_candidates: list[str]) -> CipherParams:
+def verify_sqlcipher4_raw_key(page: bytes, key_hex: str) -> bool:
+    """Authenticate a standard encrypted-header 4096-byte SQLCipher 4 page."""
+    if len(page) != 4096 or not KEY_RE.fullmatch(key_hex):
+        return False
+    mac_salt = bytes(value ^ 0x3A for value in page[:16])
+    mac_key = hashlib.pbkdf2_hmac("sha512", bytes.fromhex(key_hex), mac_salt, 2, 32)
+    digest = hmac.new(mac_key, page[16:4032] + struct.pack("<I", 1), hashlib.sha512).digest()
+    return hmac.compare_digest(digest, page[4032:])
+
+
+def probe_cipher_params(db_path: Path, key_candidates: list[str], *,
+                        required: bool = True, key_mode: str = "auto") -> CipherParams | None:
     errors: list[str] = []
+    with db_path.open("rb") as handle:
+        page = handle.read(4096)
+    if key_mode in ("auto", "raw64", "raw96"):
+        for index, key_hex in enumerate(key_candidates, 1):
+            if verify_sqlcipher4_raw_key(page, key_hex):
+                mode = "raw64" if key_mode == "auto" else key_mode
+                params = CipherParams(key_hex, index, 4, "key_first", mode)
+                if probe_database_with_params(db_path, params)["ok"]:
+                    return params
+    modes = KEY_MODES if key_mode == "auto" else (key_mode,)
     for index, key_hex in enumerate(key_candidates, 1):
-        for key_mode in KEY_MODES:
-            for compatibility in (3, 4):
-                for order in ("key_first", "compat_first"):
-                    result = run_sqlcipher(db_path, sqlcipher_probe_script(db_path, key_hex, compatibility, order, key_mode))
-                    if sqlcipher_probe_success(result):
-                        return CipherParams(
-                            key_hex=key_hex,
-                            key_index=index,
-                            compatibility=compatibility,
-                            order=order,
-                            key_mode=key_mode,
-                        )
-                    message = (result.stderr or result.stdout).strip().splitlines()
-                    if message:
-                        errors.append(
-                            f"candidate={index} mode={key_mode} compat={compatibility} order={order}: {message[-1]}"
-                        )
+        for mode in modes:
+            for compatibility in (4, 3):
+                result = run_sqlcipher(db_path, sqlcipher_probe_script(db_path, key_hex, compatibility, "key_first", mode))
+                if sqlcipher_probe_success(result):
+                    return CipherParams(key_hex, index, compatibility, "key_first", mode)
+                message = (result.stderr or result.stdout).strip().splitlines()
+                if message:
+                    errors.append(f"candidate={index} mode={mode} compat={compatibility}: {message[-1]}")
+    if not required:
+        return None
     fail(
-        "SQLCipher could not open the first database with the provided key candidates. "
+        "SQLCipher could not open this database with the provided key candidates. "
         + " | ".join(errors[-5:])
     )
 
@@ -299,7 +350,7 @@ def probe_database_with_params(db_path: Path, params: CipherParams) -> dict[str,
         "database": str(db_path),
         "ok": sqlcipher_probe_success(result),
     }
-    number = re.search(r"\b[0-9]+\b", result.stdout)
+    number = re.search(r"(?m)^\d+\s*$", result.stdout)
     if number:
         item["sqlite_master_count"] = int(number.group(0))
     if not item["ok"]:
@@ -311,19 +362,8 @@ def probe_database_with_params(db_path: Path, params: CipherParams) -> dict[str,
 def sqlcipher_export_script(db_path: Path, key_hex: str, compatibility: int, order: str, key_mode: str, plain_db: Path) -> str:
     plain = str(plain_db).replace("'", "''")
     key_pragma = sqlcipher_key_pragma(db_path, key_hex, key_mode)
-    pragmas: list[str]
-    if order == "compat_first":
-        pragmas = [
-            f"PRAGMA cipher_compatibility = {compatibility};",
-            key_pragma,
-            "PRAGMA cipher_page_size = 4096;",
-        ]
-    else:
-        pragmas = [
-            key_pragma,
-            f"PRAGMA cipher_compatibility = {compatibility};",
-            "PRAGMA cipher_page_size = 4096;",
-        ]
+    pragmas = [key_pragma, f"PRAGMA cipher_compatibility = {compatibility};",
+               "PRAGMA cipher_page_size = 4096;"]
     return "\n".join(
         pragmas
         + [
@@ -339,7 +379,10 @@ def sqlcipher_export_script(db_path: Path, key_hex: str, compatibility: int, ord
 def validate_plain_db(path: Path) -> int:
     con = open_plain_sqlite(path)
     try:
-        return int(con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0])
+        count = int(con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0])
+        if con.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise sqlite3.DatabaseError("decrypted database failed quick_check")
+        return count
     finally:
         con.close()
 
@@ -350,8 +393,11 @@ def open_plain_sqlite(path: Path) -> sqlite3.Connection:
     return con
 
 
-def decrypt_database(db_path: Path, plain_root: Path, params: CipherParams) -> Path | None:
-    if "snapshot" in db_path.parts:
+def decrypt_database(db_path: Path, plain_root: Path, params: CipherParams,
+                     snapshot_root: Path | None = None) -> Path | None:
+    if snapshot_root is not None:
+        rel = db_path.relative_to(snapshot_root)
+    elif "snapshot" in db_path.parts:
         parts = list(db_path.parts)
         index = len(parts) - 1 - list(reversed(parts)).index("snapshot")
         rel = Path(*parts[index + 1 :])
@@ -359,8 +405,8 @@ def decrypt_database(db_path: Path, plain_root: Path, params: CipherParams) -> P
         rel = Path(db_path.name)
     plain_db = plain_root / rel
     plain_db.parent.mkdir(parents=True, exist_ok=True)
-    if plain_db.exists():
-        plain_db.unlink()
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(plain_db) + suffix).unlink(missing_ok=True)
     result = run_sqlcipher(
         db_path,
         sqlcipher_export_script(
@@ -373,10 +419,12 @@ def decrypt_database(db_path: Path, plain_root: Path, params: CipherParams) -> P
         ),
     )
     if result.returncode != 0:
+        plain_db.unlink(missing_ok=True)
         return None
     try:
         validate_plain_db(plain_db)
     except sqlite3.DatabaseError:
+        plain_db.unlink(missing_ok=True)
         return None
     return plain_db
 
@@ -556,9 +604,21 @@ def normalize_message_row(
         "subtype": raw.get(subtype_col) if subtype_col else None,
         "create_time": timestamp,
         "create_time_iso": decode_time(timestamp),
-        "content": raw.get(content_col) if content_col else None,
+        "content": decode_message_content(raw.get(content_col)) if content_col else None,
     }
     return item
+
+
+def decode_message_content(value: Any) -> Any:
+    if not isinstance(value, bytes):
+        return value
+    if value.startswith(b"\x28\xb5\x2f\xfd"):
+        try:
+            import zstandard
+        except ImportError:
+            fail("compressed messages require zstandard; install wechat4/scripts/requirements.txt")
+        value = zstandard.ZstdDecompressor().decompress(value, max_output_size=32 * 1024 * 1024)
+    return value.decode("utf-8", "replace")
 
 
 def export_messages(plain_dbs: list[Path], out_dir: Path, contacts: dict[str, dict[str, Any]]) -> int:
@@ -655,14 +715,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Snapshot and export WeChat 4.x WCDB chat databases.")
     parser.add_argument("--account-path", type=Path, help="Path to wxid_* account directory. Auto-discovers under /mnt/c/Users if omitted.")
     parser.add_argument("--key-hex", help="64 hex SQLCipher raw key. Accepts either raw hex or x'<hex>'.")
-    parser.add_argument("--key-candidates-json", type=Path, help="JSON file produced by Capture-WeChatKey-DebugApi.ps1; tries each KeyHex entry.")
-    parser.add_argument("--auto-key", action="store_true", help="Call Get-WeChatDbKey.ps1 through powershell.exe when --key-hex is omitted.")
+    parser.add_argument("--key-candidates-json", type=Path, help="Config.Cipher or legacy capture JSON; keys are verified independently for every database.")
+    parser.add_argument("--auto-key", action="store_true", help="Read Config.Cipher from logged-in WeChat; does not restart or debug the process.")
+    parser.add_argument("--process-id", type=int, help="Optional Windows main Weixin process ID for --auto-key.")
+    parser.add_argument("--key-mode", choices=("auto",) + KEY_MODES, default="auto", help="Use raw64 for Config.Cipher captures; auto also probes legacy password modes.")
     parser.add_argument("--out-dir", type=Path, default=Path("exports") / dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--snapshot-only", action="store_true", help="Only copy encrypted DB/WAL/SHM files.")
     parser.add_argument("--snapshot-dir", type=Path, help="Use an existing snapshot directory instead of copying from the account path.")
     parser.add_argument("--probe-only", action="store_true", help="Only verify SQLCipher parameters against the snapshot; do not decrypt or export plaintext DBs.")
     args = parser.parse_args()
 
+    os.umask(0o077)
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -670,16 +733,22 @@ def main() -> int:
     except OSError:
         pass
 
-    account_path = args.account_path.resolve() if args.account_path else discover_account_path()
+    account_path = args.account_path.resolve() if args.account_path else None
     if args.snapshot_dir:
-        snapshot_dbs = sorted(args.snapshot_dir.rglob("*.db"))
+        snapshot_root = args.snapshot_dir.resolve()
+        snapshot_dbs = sorted(snapshot_root.rglob("*.db"))
     else:
+        account_path = account_path or discover_account_path()
+        snapshot_root = out_dir / "snapshot"
         snapshot_dbs = make_snapshot(account_path, out_dir)
+    if not snapshot_dbs:
+        fail("no databases found in the snapshot")
 
     metadata: dict[str, Any] = {
-        "account_path": str(account_path),
+        "account_path": str(account_path) if account_path else None,
         "output_dir": str(out_dir),
         "snapshot_databases": [str(p) for p in snapshot_dbs],
+        "snapshot_consistency": "caller-provided" if args.snapshot_dir else "live-copy-stability-checked; not an atomic snapshot",
     }
 
     if args.snapshot_only:
@@ -687,6 +756,7 @@ def main() -> int:
         print(json.dumps(metadata, indent=2))
         return 0
 
+    metadata["sqlcipher_version"] = require_sqlcipher4()
     key_candidates: list[str] = []
     if args.key_hex:
         key_candidates.append(normalize_key(args.key_hex))
@@ -695,37 +765,38 @@ def main() -> int:
             if candidate not in key_candidates:
                 key_candidates.append(candidate)
     if not key_candidates and args.auto_key:
-        source_rel = key_capture_relative(account_path)
-        if not source_rel:
-            fail("auto key capture needs a message_*.db source database")
-        key_candidates.append(capture_key_with_powershell(account_path / source_rel))
+        key_candidates = capture_config_keys(out_dir / "key-candidates-config.json", args.process_id)
+        if args.key_mode == "auto":
+            args.key_mode = "raw64"
     if not key_candidates:
         fail("missing key input. Pass --key-hex, --key-candidates-json, or --auto-key while WeChat is running.")
 
-    first_db = next((p for p in snapshot_dbs if MESSAGE_DB_RE.match(p.name)), snapshot_dbs[0])
-    cipher_params = probe_cipher_params(first_db, key_candidates)
-
-    metadata.update(
-        {
-            "key_candidate_count": len(key_candidates),
-            "key_candidate_index": cipher_params.key_index,
-            "cipher_compatibility": cipher_params.compatibility,
-            "cipher_order": cipher_params.order,
-            "cipher_key_mode": cipher_params.key_mode,
-        }
-    )
+    metadata["key_candidate_count"] = len(key_candidates)
+    params_by_database: dict[Path, CipherParams] = {}
+    probe_results = []
+    for db_path in snapshot_dbs:
+        params = probe_cipher_params(db_path, key_candidates, required=False, key_mode=args.key_mode)
+        result: dict[str, Any] = {"database": str(db_path), "ok": params is not None}
+        if params is not None:
+            params_by_database[db_path] = params
+            result.update(key_candidate_index=params.key_index, cipher_compatibility=params.compatibility,
+                          cipher_order=params.order, cipher_key_mode=params.key_mode)
+        else:
+            result["error"] = "no verified key/parameters for this database"
+        probe_results.append(result)
+    metadata["probe_results"] = probe_results
 
     if args.probe_only:
-        metadata["probe_results"] = [probe_database_with_params(db_path, cipher_params) for db_path in snapshot_dbs]
         (out_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(metadata, ensure_ascii=False, indent=2))
-        return 0
+        return 0 if all(result["ok"] for result in probe_results) else 1
 
     plain_root = out_dir / "plain"
     plain_dbs: list[Path] = []
     failed: list[str] = []
     for db_path in snapshot_dbs:
-        plain = decrypt_database(db_path, plain_root, cipher_params)
+        params = params_by_database.get(db_path)
+        plain = decrypt_database(db_path, plain_root, params, snapshot_root) if params else None
         if plain:
             plain_dbs.append(plain)
         else:
@@ -752,7 +823,7 @@ def main() -> int:
     )
     (out_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(metadata, ensure_ascii=False, indent=2))
-    return 0
+    return 0 if not failed else 1
 
 
 if __name__ == "__main__":

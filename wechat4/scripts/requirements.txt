@@ -1,0 +1,2 @@
+# Message bodies may be stored as Zstandard BLOBs on WeChat 4.x.
+zstandard>=0.22

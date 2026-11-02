@@ -1,6 +1,11 @@
 # Key Capture Notes
 
-The preferred capture path is a precise debugger breakpoint, not broad process-memory scanning.
+For validated 4.2.0.12, use `Get-WeChat4ConfigKeys.ps1`: bounded, read-only
+Config.Cipher traversal, XOR decoding and file-only candidate output. See
+[4.2 migration notes](WECHAT_4_2.md) for evidence, limits and attribution.
+No new debugger RVA is asserted.
+
+The debugger workflow below is the historical **4.1.11.54** path.
 
 ## Breakpoint target
 
@@ -43,4 +48,7 @@ asciihex
 hexkey
 ```
 
-with SQLCipher compatibility 3 and 4. A candidate is accepted only after a database can read `sqlite_master`.
+with compatibility 3/4 applied after the key. Each database independently
+selects a candidate after a schema read; modern raw candidates first receive a
+SQLCipher 4 page-HMAC check. Decrypted databases must pass `quick_check`.
+Probe and export return nonzero if any selected database fails.
